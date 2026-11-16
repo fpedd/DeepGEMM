@@ -204,6 +204,57 @@ def test_fp8_bhr_hdr_bhd(use_ue8m0: bool = True):
     print()
 
 
+@test_filter(lambda: get_arch_major() == 10)
+def test_fp8_clamp_count_graph_replay(num_replays: int = 100):
+    # CUDA graph replays reuse the kernel's grid index; alternating two inputs makes any
+    # clamp count accumulated before the in-kernel reset show up as a mismatch
+    print('Testing FP8 clamp count under CUDA graph replay:')
+    h, r, d = 8, 4096, 1024
+    for b in (4, 128, 4096):
+        y = torch.randn((h, d, r), device='cuda', dtype=torch.bfloat16)
+        y_fp8 = (torch.empty_like(y, dtype=torch.float8_e4m3fn),
+                 torch.empty((h, ceil_div(d, 128), ceil_div(r, 128)), device='cuda', dtype=torch.float))
+        for i in range(h):
+            y_fp8[0][i], y_fp8[1][i] = per_block_cast_to_fp8(y[i], use_ue8m0=True)
+        xs = []
+        for _ in range(2):
+            x_fp8 = per_token_cast_to_fp8(torch.randn((b * h, r), device='cuda', dtype=torch.bfloat16), use_ue8m0=True)
+            xs.append((x_fp8[0].view(b, h, r), x_fp8[1].view(b, h, ceil_div(r, 128))))
+        x_fp8 = tuple(t.clone() for t in xs[0])
+        output = torch.empty((b, h, d), device='cuda', dtype=torch.float8_e4m3fn)
+        sfd = torch.empty_strided((b, ceil_div(h * d, 32 * 4)), (1, align(b, 4)), dtype=torch.int32, device='cuda')
+        clamped_count = torch.empty(1, device='cuda', dtype=torch.uint32)
+        epilogue = deep_gemm.epilogue.FP8CastWithClamp(
+            sfd=sfd, clamp_value=2.576 * r ** 0.5, clamped_count=clamped_count)
+
+        # Eager launches give the references and set up the stream before capture
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        expected = []
+        with torch.cuda.stream(stream):
+            for x in xs:
+                for dst, src in zip(x_fp8, x):
+                    dst.copy_(src)
+                deep_gemm.fp8_einsum('bhr,hdr->bhd', x_fp8, y_fp8, output, epilogue=epilogue)
+                expected.append((output.view(torch.uint8).clone(), sfd.clone(), clamped_count.clone()))
+        stream.synchronize()
+        assert not torch.equal(expected[0][2], expected[1][2])
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            deep_gemm.fp8_einsum('bhr,hdr->bhd', x_fp8, y_fp8, output, epilogue=epilogue)
+        num_mismatches = 0
+        for i in range(num_replays):
+            for dst, src in zip(x_fp8, xs[i % 2]):
+                dst.copy_(src)
+            graph.replay()
+            num_mismatches += not all(torch.equal(t, ref) for t, ref in
+                                      zip((output.view(torch.uint8), sfd, clamped_count), expected[i % 2]))
+        assert num_mismatches == 0, f'{b=}: {num_mismatches}/{num_replays} CUDA graph replays mismatched'
+        print(f' > {b=}: {num_replays} replays passed')
+    print()
+
+
 @test_filter(lambda: get_arch_major() >= 10)
 def test_fp8_bhd_hdr_bhr(use_ue8m0: bool = True):
     deep_gemm.use_deterministic_algorithms(False)
@@ -285,5 +336,6 @@ if __name__ == '__main__':
     test_bhd_bhr_hdr()
 
     test_fp8_bhr_hdr_bhd()
+    test_fp8_clamp_count_graph_replay()
     test_fp8_bhd_hdr_bhr()
     test_fp8_bhd_bhr_hdr()
