@@ -125,18 +125,20 @@ public:
     using Identity::Identity;
 
     // Reset while the MMA pipeline starts; idle CTAs need no counter work.
+    // NOTES: CTAs count their arrivals after block 0's reset, and the last one rezeroes the counter for the
+    //        next launch on this stream. A grid tag would not work, as CUDA graph replays reuse `%gridid`.
     CUTLASS_DEVICE void init(const uint32_t& num_blocks, const uint32_t& epilogue_thread_idx) {
         count_enabled = args.clamped_count != nullptr and blockIdx.x < num_blocks;
         if (not count_enabled or epilogue_thread_idx != 0)
             return;
-        const auto grid_tag = ptx::get_grid_idx() + 1;
-        const auto ready_ptr = reinterpret_cast<decltype(grid_tag)*>(args.clamp_count_ready);
+        const auto num_arrivals_ptr = args.clamp_count_ready;
         if (blockIdx.x == 0) {
             *args.clamped_count = 0;
-            ptx::st_rel(ready_ptr, grid_tag);
         } else {
-            while (ptx::ld_acq_gpu(ready_ptr) != grid_tag) {}
+            while (ptx::ld_acq_gpu(num_arrivals_ptr) == 0) {}
         }
+        if (ptx::atomic_add_rel(num_arrivals_ptr, 1) == cute::min(num_blocks, gridDim.x) - 1)
+            *num_arrivals_ptr = 0;
     }
 
     // Round and count BF16 values, then compute SFs for the chosen TMEM layout.
