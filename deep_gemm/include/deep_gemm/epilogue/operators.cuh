@@ -125,8 +125,9 @@ public:
     using Identity::Identity;
 
     // Reset while the MMA pipeline starts; idle CTAs need no counter work.
-    // NOTES: CTAs count their arrivals after block 0's reset, and the last one rezeroes the counter for the
-    //        next launch on this stream. A grid tag would not work, as CUDA graph replays reuse `%gridid`.
+    // NOTES: block 0 resets the count and arrives first, the other CTAs wait for that arrival before they add,
+    //        and the last arrival rezeroes the counter for the next launch on this stream. A launch tag cannot
+    //        be used instead, as CUDA graph replays reuse `%gridid`.
     CUTLASS_DEVICE void init(const uint32_t& num_blocks, const uint32_t& epilogue_thread_idx) {
         count_enabled = args.clamped_count != nullptr and blockIdx.x < num_blocks;
         if (not count_enabled or epilogue_thread_idx != 0)

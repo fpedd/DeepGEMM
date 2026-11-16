@@ -78,7 +78,7 @@ class FP8CastWithClampEpilogue final: public EpilogueClass {
         if (not ready.defined()) {
             // Initialize each stream once, before graph capture.
             DG_HOST_ASSERT(c10::cuda::currentStreamCaptureStatusMayInitCtx() == c10::cuda::CaptureStatus::None);
-            ready = torch::zeros({2}, torch::TensorOptions().device(stream.device()).dtype(torch::kUInt32));
+            ready = torch::zeros({1}, torch::TensorOptions().device(stream.device()).dtype(torch::kUInt32));
         }
         return static_cast<uint32_t*>(ready.data_ptr());
     }
